@@ -582,6 +582,12 @@ textarea.form-input{resize:vertical;min-height:70px}
     <select class="filter-select" id="posTitleFilter" onchange="renderPosTable()" style="font-size:15px">
       <option value="">所有職位</option>
     </select>
+    <select class="filter-select" id="posPriorityFilter" onchange="renderPosTable()">
+      <option value="">全部優先</option>
+      <option value="高">高</option>
+      <option value="中">中</option>
+      <option value="低">低</option>
+    </select>
     <select class="filter-select" id="posSortDate" onchange="renderPosTable()">
       <option value="desc">開案日 由近到遠 ↓</option>
       <option value="asc">開案日 由遠到近 ↑</option>
@@ -1026,6 +1032,15 @@ textarea.form-input{resize:vertical;min-height:70px}
       <div style="font-size:13px;color:var(--text3);margin-top:8px" id="lastBackupTime"></div>
     </div>
     <div class="section">
+      <div class="section-header"><div class="section-title">對齊檢查</div></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px">
+        <div style="font-size:15px;color:var(--text2);margin-bottom:10px">先下載完整 JSON 備份，再預覽會對齊的筆數（職位名稱、目標職位、推薦人數、面試欄位、優先）。不會自動寫入。</div>
+        <button class="btn" type="button" id="btn-repair-preview" onclick="previewDataRepair()">預覽對齊（先下載備份）</button>
+        <button class="btn-ghost" type="button" id="btn-repair-apply" onclick="applyDataRepair()" style="margin-left:8px" disabled>套用預覽</button>
+        <div id="repairPreview" style="margin-top:12px;font-size:14px;color:var(--text2);white-space:pre-wrap"></div>
+      </div>
+    </div>
+    <div class="section">
       <div class="section-header"><div class="section-title">匯入人選資料</div></div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px">
         <div style="font-size:15px;color:var(--text2);margin-bottom:6px">上傳由 Excel 轉換的人選 JSON 檔案，合併新增至現有人選資料庫（不會覆蓋現有資料）。</div>
@@ -1233,6 +1248,35 @@ textarea.form-input{resize:vertical;min-height:70px}
       <div style="display:flex;gap:8px;padding-top:10px;border-top:1px solid var(--border)">
         <button class="btn-ghost" onclick="editProjPosition()">✏ 編輯職位</button>
         <button class="btn-danger" onclick="deleteProjPosition()">刪除案子</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Client Detail Panel -->
+<div class="proj-overlay" id="clientOverlay" onclick="closeClientPanel(event)">
+  <div class="proj-panel" id="clientPanel">
+    <div class="proj-header">
+      <div class="proj-client-label" id="cp-kicker"></div>
+      <div class="proj-title" id="cp-name"></div>
+      <div class="proj-meta" id="cp-meta"></div>
+      <button class="proj-close" type="button" onclick="closeClientPanelDirect()">✕</button>
+    </div>
+    <div class="proj-body">
+      <div class="proj-section">
+        <div class="proj-section-title">客戶資料</div>
+        <div class="proj-info-grid" id="cp-fields"></div>
+      </div>
+      <div class="proj-section">
+        <div class="proj-section-title">聯絡人</div>
+        <div id="cp-contacts"></div>
+      </div>
+      <div class="proj-section">
+        <div class="proj-section-title">相關職位與 Pipeline <span id="cp-pos-count" style="color:var(--accent);font-family:var(--mono);font-size:15px"></span></div>
+        <div id="cp-positions"></div>
+      </div>
+      <div style="display:flex;gap:8px;padding-top:10px;border-top:1px solid var(--border)">
+        <button class="btn-ghost" type="button" onclick="editClientFromPanel()">✏ 編輯客戶</button>
       </div>
     </div>
   </div>
@@ -1922,9 +1966,16 @@ function save(){
   clearTimeout(_fbSaveTimer);
   _fbSaveTimer = setTimeout(()=>{
     if(!fbAuth?.currentUser) return;
-    fbDb?.ref('data').set(JSON.parse(JSON.stringify(S)))
-      .then(()=>{ _fbSaveTimer=null; })
-      .catch(e=>{ console.error('save:', e); showToast('⚠ 儲存失敗，請檢查網路'); });
+    const local = JSON.parse(JSON.stringify(S));
+    const delta = computeDelta(local, _baseJson);
+    if(!delta.any){ _fbSaveTimer=null; return; }
+    fbDb.ref('data').transaction(remote=>{
+      return applyDelta(remote||{}, local, delta);
+    }, (err, committed)=>{
+      _fbSaveTimer=null;
+      if(err){ console.error('save:', err); showToast('⚠ 儲存失敗，請檢查網路'); return; }
+      if(committed) captureBaseline();
+    }, false);
   }, 800);
 }
 
@@ -1966,6 +2017,8 @@ function _mergeData(d){
   if(!S.candidates) S.candidates=[];
   if(!S.positions)  S.positions=[];
   if(!S.partnerConsultants) S.partnerConsultants=['Angus Lin','Henry Lee','Jamie Liang','Alien Liao','Ivy Liu','Arthur Chang'];
+  CRM_LISTS.forEach(k=>{ if(S[k]) S[k]=asList(S[k]); });
+  captureBaseline();
 }
 
 // ── 即時同步 ──
@@ -2146,7 +2199,200 @@ function _setVisible(id, show){
 
 // ── Helpers ──
 const $ = id => document.getElementById(id);
-function today(){ return new Date().toISOString().split('T')[0]; }
+function taipeiParts(d){
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Taipei', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hourCycle:'h23' });
+  const o = {};
+  fmt.formatToParts(d||new Date()).forEach(p=>{ if(p.type!=='literal') o[p.type]=p.value; });
+  return o;
+}
+function today(){
+  const p = taipeiParts();
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function taipeiTime(){
+  const p = taipeiParts();
+  return `${p.hour}:${p.minute}`;
+}
+function taipeiDateObj(){
+  const p = taipeiParts();
+  return new Date(`${p.year}-${p.month}-${p.day}T12:00:00+08:00`);
+}
+function ymdFromDate(d){
+  const p = taipeiParts(d);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function normalizePriority(v){
+  const raw = String(v==null?'':v).trim();
+  const key = raw.toLowerCase();
+  if(raw==='高' || key==='high' || key==='h') return '高';
+  if(raw==='中' || key==='medium' || key==='mid' || key==='m') return '中';
+  if(raw==='低' || key==='low' || key==='l') return '低';
+  if(!raw) return '中';
+  return raw;
+}
+function eachPipeline(c){
+  const rows = Array.isArray(c&&c.posHistory) ? c.posHistory.slice() : [];
+  if(c && c.positionId!=null && !rows.some(h=>String(h.posId)===String(c.positionId))){
+    rows.push({ posId:c.positionId, status:c.status||'', logs:[], date:c.addDate||'', posClient:'', posTitle:'', note:'' });
+  }
+  return rows;
+}
+function pipelineNames(h){
+  const p = (S.positions||[]).find(x=>String(x.id)===String(h&&h.posId));
+  if(p) return { client:p.client||'', title:p.title||'', missing:false };
+  return { client:(h&&h.posClient)||'', title:(h&&h.posTitle)||'', missing:!p };
+}
+function countPipelines(posId){
+  let n = 0;
+  (S.candidates||[]).forEach(c=>{
+    eachPipeline(c).forEach(h=>{ if(String(h.posId)===String(posId)) n++; });
+  });
+  return n;
+}
+function pipelineReached(h, statuses){
+  const set = new Set(statuses);
+  const dates = [];
+  (h.logs||[]).forEach(l=>{ if(l && set.has(l.status) && l.date) dates.push(String(l.date).slice(0,10)); });
+  const statusHit = set.has(h.status) || (h.logs||[]).some(l=>l && set.has(l.status));
+  if(!statusHit) return null;
+  if(!dates.length && h.date && set.has(h.status)) dates.push(String(h.date).slice(0,10));
+  dates.sort();
+  return { reached:true, date:dates[0]||'' };
+}
+const FUNNEL_STAGE_DEFS = [
+  { key:'shortlist', label:'Shortlist', exact:['履歷推薦'], reached:['履歷推薦','面試-1st','面試-2nd','面試-3rd','客戶面試','Offer Stage','等待入職','入職','已成交'], color:'#3d6fa8' },
+  { key:'interview', label:'Interview', exact:['面試-1st','面試-2nd','面試-3rd','客戶面試'], reached:['面試-1st','面試-2nd','面試-3rd','客戶面試','Offer Stage','等待入職','入職','已成交'], color:'#c4973a' },
+  { key:'offer', label:'Offer stage', exact:['Offer Stage','等待入職','入職'], reached:['Offer Stage','等待入職','入職','已成交'], color:'#2d8a72' },
+  { key:'close', label:'Close case', exact:['已成交'], reached:['已成交'], color:'#b85260' }
+];
+function computeFunnel(data, win, owner){
+  const stages = FUNNEL_STAGE_DEFS.map(s=>({ ...s, ever:0, current:0 }));
+  ((data&&data.candidates)||[]).forEach(c=>{
+    if(owner && c.owner!==owner) return;
+    eachPipeline(c).forEach(h=>{
+      stages.forEach(s=>{
+        const hit = pipelineReached(h, s.reached);
+        if(hit && hit.date && hit.date>=win.start && hit.date<=win.end) s.ever++;
+        if(s.exact.includes(h.status)) s.current++;
+      });
+    });
+  });
+  stages.forEach((s,i)=>{
+    const prev = i ? stages[i-1].ever : 0;
+    s.conv = i && prev ? Math.round(s.ever / prev * 100) : null;
+  });
+  return stages;
+}
+function asList(v){
+  if(Array.isArray(v)) return v.filter(x=>x!=null);
+  if(v && typeof v==='object') return Object.keys(v).sort((a,b)=>Number(a)-Number(b)).map(k=>v[k]).filter(x=>x!=null && typeof x==='object');
+  return [];
+}
+function stableClone(v){
+  if(Array.isArray(v)) return v.map(stableClone);
+  if(v && typeof v==='object'){
+    const o = {};
+    Object.keys(v).sort().forEach(k=>{ o[k]=stableClone(v[k]); });
+    return o;
+  }
+  return v;
+}
+function indexById(list){
+  const m = {};
+  asList(list).forEach(item=>{ if(item && item.id!=null) m[String(item.id)] = item; });
+  const sorted = {};
+  Object.keys(m).sort().forEach(id=>{ sorted[id]=m[id]; });
+  return sorted;
+}
+const CRM_LISTS = ['candidates','positions','clients','deals','actions','attendance','contracts'];
+function snapshotForDelta(src){
+  const o = {};
+  CRM_LISTS.forEach(k=>{ o[k]=indexById(src[k]); });
+  o.users = src.users||[];
+  o.userMeta = src.userMeta||{};
+  o.partnerConsultants = src.partnerConsultants||[];
+  return stableClone(o);
+}
+let _baseJson = '';
+function captureBaseline(){ _baseJson = JSON.stringify(snapshotForDelta(S)); }
+function computeDelta(local, baseJson){
+  const L = snapshotForDelta(local);
+  const B = baseJson ? JSON.parse(baseJson) : snapshotForDelta({});
+  const delta = {};
+  CRM_LISTS.forEach(k=>{
+    const changed=[], removed=[];
+    const now = L[k]||{}, was = B[k]||{};
+    Object.keys(now).forEach(id=>{
+      if(JSON.stringify(now[id])!==JSON.stringify(was[id]||null)) changed.push(id);
+    });
+    Object.keys(was).forEach(id=>{ if(!(id in now)) removed.push(id); });
+    delta[k] = { changed, removed };
+  });
+  delta.users = JSON.stringify(L.users)!==JSON.stringify(B.users||[]);
+  delta.userMeta = JSON.stringify(L.userMeta)!==JSON.stringify(B.userMeta||{});
+  delta.partnerConsultants = JSON.stringify(L.partnerConsultants)!==JSON.stringify(B.partnerConsultants||[]);
+  delta.any = CRM_LISTS.some(k=>delta[k].changed.length||delta[k].removed.length) || delta.users || delta.userMeta || delta.partnerConsultants;
+  return delta;
+}
+function applyDelta(remote, local, delta){
+  const out = (remote && typeof remote==='object') ? JSON.parse(JSON.stringify(remote)) : {};
+  CRM_LISTS.forEach(k=>{
+    const remoteItems = asList(out[k]);
+    const map = indexById(remoteItems);
+    const localMap = indexById(local[k]);
+    const noId = remoteItems.filter(item=>!item || item.id==null);
+    (delta[k].changed||[]).forEach(id=>{ if(localMap[id]) map[id]=localMap[id]; });
+    (delta[k].removed||[]).forEach(id=>{ delete map[id]; });
+    const seen = new Set();
+    const order = [];
+    remoteItems.forEach(item=>{
+      if(item && item.id!=null && map[String(item.id)]){
+        order.push(map[String(item.id)]);
+        seen.add(String(item.id));
+      }
+    });
+    Object.keys(map).sort().forEach(id=>{ if(!seen.has(id)) order.push(map[id]); });
+    out[k] = noId.concat(order);
+  });
+  if(delta.users) out.users = local.users||[];
+  if(delta.userMeta) out.userMeta = Object.assign({}, out.userMeta||{}, local.userMeta||{});
+  if(delta.partnerConsultants) out.partnerConsultants = local.partnerConsultants||[];
+  if(remote && Object.prototype.hasOwnProperty.call(remote, 'currentUser')) out.currentUser = remote.currentUser;
+  else delete out.currentUser;
+  return out;
+}
+function normalizeCrm(data){
+  const s = JSON.parse(JSON.stringify(data));
+  const pos = {};
+  (s.positions||[]).forEach(p=>{ pos[String(p.id)] = p; });
+  const summary = { titles:0, targets:0, counts:0, interviews:0, statuses:0, priorities:0 };
+  const actual = {};
+  (s.candidates||[]).forEach(c=>{
+    (c.posHistory||[]).forEach(h=>{
+      const p = pos[String(h.posId)];
+      if(p){
+        if((h.posClient||'')!==(p.client||'')){ h.posClient=p.client||''; summary.titles++; }
+        if((h.posTitle||'')!==(p.title||'')){ h.posTitle=p.title||''; summary.titles++; }
+      }
+      actual[String(h.posId)] = (actual[String(h.posId)]||0)+1;
+    });
+    if(c.positionId!=null && pos[String(c.positionId)]){
+      const p = pos[String(c.positionId)];
+      const tgt = `${p.client}．${p.title}`;
+      if((c.target||'')!==tgt){ c.target = tgt; summary.targets++; }
+      const h = (c.posHistory||[]).find(x=>String(x.posId)===String(c.positionId));
+      if(h && h.status && c.status!==h.status){ c.status = h.status; summary.statuses++; }
+    }
+    if(typeof materializeCandidateInterview==='function' && materializeCandidateInterview(c)) summary.interviews++;
+  });
+  (s.positions||[]).forEach(p=>{
+    const n = actual[String(p.id)]||0;
+    if(Number(p.candidates)!==n){ p.candidates = n; summary.counts++; }
+    const pri = normalizePriority(p.priority);
+    if(p.priority!==pri && ['高','中','低'].includes(pri)){ p.priority = pri; summary.priorities++; }
+  });
+  return { data:s, summary };
+}
 function fmtDate(d){ if(!d) return '—'; const p = d.split('-'); return p.length===3?`${p[1]}/${p[2]}`:'—'; }
 function fmtFull(d){ if(!d) return '—'; const p=d.split('-'); return p.length===3?`${p[0]}/${p[1]}/${p[2]}`:'—'; }
 
@@ -2166,7 +2412,7 @@ function badge(s){
   };
   return `<span class="badge ${m[s]||'b-hold'}">${escHtml(s)}</span>`;
 }
-function priB(p){ return `<span class="priority ${p==='高'?'p-high':p==='中'?'p-mid':'p-low'}">${escHtml(p)}</span>`; }
+function priB(p){ const n = normalizePriority(p); return `<span class="priority ${n==='高'?'p-high':n==='中'?'p-mid':'p-low'}">${escHtml(n)}</span>`; }
 function willB(w){
   if(w==='主動求職') return `<span style="color:var(--accent);font-size:13px">● 主動</span>`;
   if(w==='被動開放') return `<span style="color:var(--accent);font-size:13px">◐ 被動</span>`;
@@ -2267,7 +2513,7 @@ function applyPipelineEdit(c, posId, fields){
     if(!Array.isArray(h.commLogs)) h.commLogs = [];
     h.commLogs.push({
       date: fields.logDate || today(),
-      time: fields.logTime || new Date().toTimeString().slice(0,5),
+      time: fields.logTime || taipeiTime(),
       text: fields.logText
     });
   }
@@ -2288,7 +2534,7 @@ function listCandidateInterviews(c){
     out.push({
       date: iv.date, time: iv.time||'', note: iv.note||'',
       posId: h.posId, round: h.status||'',
-      client: h.posClient||'', title: h.posTitle||'', legacy: false
+      client: pipelineNames(h).client, title: pipelineNames(h).title, legacy: false
     });
   });
   const seen = new Set(out.map(x => [x.date, x.time, x.note].join('|')));
@@ -2881,8 +3127,8 @@ function openDetail(id){
         <!-- Header row -->
         <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px">
           <div style="min-width:0;flex:1;cursor:pointer" onclick="showPage('positions');setTimeout(()=>openProjPanel(${hId}),60)">
-            <div style="font-size:15px;font-weight:700;color:#1a1a1a">${escHtml(h.posClient)}</div>
-            <div style="font-size:17px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(h.posTitle)}</div>
+            <div style="font-size:15px;font-weight:700;color:#1a1a1a">${escHtml(pipelineNames(h).client||'—')}</div>
+            <div style="font-size:17px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(pipelineNames(h).title||'—')}${pipelineNames(h).missing?' <span style="font-size:11px;color:var(--text3)">（原職位已不在清單）</span>':''}</div>
             ${h.date?`<div style="font-size:15px;color:var(--text);margin-top:2px;font-family:var(--mono)">${escHtml(h.date)}</div>`:''}
           </div>
           <div style="display:flex;flex-direction:row;align-items:center;gap:4px;flex-shrink:0">
@@ -3033,7 +3279,7 @@ function updateCandStatus(candId, newStatus, posId){
   // 記錄最後狀態變更時間（連動 Pipeline 日期，不寫入溝通記錄）
   const now = new Date();
   c.lastStatusDate = today();
-  c.lastStatusTime = now.toTimeString().slice(0,5);
+  c.lastStatusTime = taipeiTime();
 
   save();
 
@@ -3084,7 +3330,7 @@ function assignCandToPosition(candId, posId){
   if(!c.posHistory) c.posHistory = [];
 
   if(!c.posHistory.find(h=>Number(h.posId)===Number(posId))){
-    c.posHistory.push({ posId:Number(posId), posClient:p.client, posTitle:p.title, date:today(), status:'初步接觸', note:'', logs:[{ date:today(), time:new Date().toTimeString().slice(0,5), status:'初步接觸' }] });
+    c.posHistory.push({ posId:Number(posId), posClient:p.client, posTitle:p.title, date:today(), status:'初步接觸', note:'', logs:[{ date:today(), time:taipeiTime(), status:'初步接觸' }] });
   }
 
   c.positionId = Number(posId);
@@ -3094,7 +3340,7 @@ function assignCandToPosition(candId, posId){
 
   p.lastUpdate = today();
   c.lastStatusDate = today();
-  c.lastStatusTime = new Date().toTimeString().slice(0,5);
+  c.lastStatusTime = taipeiTime();
   materializeCandidateInterview(c);
   save();
   openDetail(candId);
@@ -3126,7 +3372,7 @@ function removePosHistory(candId, posId){
       c.status = '人才庫（未推薦）';
     }
     c.lastStatusDate = today();
-    c.lastStatusTime = new Date().toTimeString().slice(0,5);
+    c.lastStatusTime = taipeiTime();
   }
 
   save();
@@ -3158,8 +3404,8 @@ function togglePosHistoryEdit(btn, candId, posId){
 
 function addPheLogRow(btn){
   const container = btn.previousElementSibling; // .phe-logs div
-  const today_ = new Date().toISOString().slice(0,10);
-  const time_ = new Date().toTimeString().slice(0,5);
+  const today_ = today();
+  const time_ = taipeiTime();
   const row = document.createElement('div');
   row.className = 'phe-log-row';
   row.style.cssText = 'display:grid;grid-template-columns:100px 52px 1fr 1fr 22px;gap:4px;align-items:center;margin-bottom:4px';
@@ -3277,7 +3523,7 @@ function submitStatusNote(note){
   materializeCandidateInterview(c);
   if(!c.posHistory) c.posHistory = [];
   const now = new Date();
-  const ts = now.toTimeString().slice(0,5);
+  const ts = taipeiTime();
   const logEntry = { date: today(), time: ts, status: newStatus, note: (note||'').trim() };
 
   const h = c.posHistory.find(x=>Number(x.posId)===Number(posId));
@@ -3297,7 +3543,7 @@ function submitStatusNote(note){
   }
 
   c.lastStatusDate = today();
-  c.lastStatusTime = now.toTimeString().slice(0,5);
+  c.lastStatusTime = taipeiTime();
 
   save();
   showToast(`✓ 狀態更新：${newStatus}`);
@@ -3438,7 +3684,7 @@ function addContactLog(){
   var now = new Date();
   c.contactLogs.push({
     date: today(),
-    time: now.toTimeString().slice(0,5),
+    time: taipeiTime(),
     owner: document.getElementById('cl-log-owner').value || '',
     text: text
   });
@@ -3716,7 +3962,7 @@ function addProjLog(){
   const p = S.positions.find(x=>x.id===openProjId); if(!p) return;
   if(!p.logs) p.logs = [];
   const now = new Date();
-  p.logs.push({ date:today(), time:now.toTimeString().slice(0,5), text });
+  p.logs.push({ date:today(), time:taipeiTime(), text });
   p.lastUpdate = today();
   save(); renderProjPanel(); render();
 }
@@ -3880,6 +4126,80 @@ function saveClient(){
   save(); render(); closeModal('addClient'); showToast('✓ 客戶已儲存');
   ['cl-name','cl-placed','cl-taxid','cl-addr','cl-url104','cl-c1name','cl-c1title','cl-c1info','cl-c2name','cl-c2title','cl-c2info','cl-lastcontact','cl-note'].forEach(id=>$(id).value='');
   $('cl-owner').value='';
+}
+
+let openClientId = null;
+const CLIENT_FIELD_LABELS = {
+  name:'客戶名稱', industry:'產業', rel:'關係', taxid:'統一編號', addr:'地址', url104:'104 連結',
+  owner:'負責人', placed:'成交數', lastContact:'最後聯繫', addDate:'建立日期', note:'備註'
+};
+function fmtFieldValue(v){
+  if(v==null || v==='') return '—';
+  if(typeof v==='object') return JSON.stringify(v, null, 2);
+  return String(v);
+}
+function openClientPanel(id){
+  openClientId = id;
+  renderClientPanel();
+  $('clientOverlay').classList.add('open');
+}
+function closeClientPanel(e){ if(e.target===$('clientOverlay')) closeClientPanelDirect(); }
+function closeClientPanelDirect(){ $('clientOverlay').classList.remove('open'); openClientId=null; }
+function editClientFromPanel(){ if(openClientId!=null) editClient(openClientId); }
+function renderClientPanel(){
+  const cl = (S.clients||[]).find(x=>String(x.id)===String(openClientId)); if(!cl) return;
+  $('cp-kicker').textContent = cl.industry || '客戶';
+  $('cp-name').textContent = cl.name || '—';
+  $('cp-meta').innerHTML = `${escHtml(cl.rel||'—')}${cl.owner?` · ${escHtml(cl.owner)}`:''}`;
+  const skip = new Set(['contacts']);
+  const preferred = ['name','industry','rel','taxid','addr','url104','owner','placed','lastContact','addDate','note'];
+  const keys = preferred.filter(k=>k in cl).concat(Object.keys(cl).filter(k=>!preferred.includes(k) && !skip.has(k)).sort());
+  $('cp-fields').innerHTML = keys.map(k=>{
+    const label = CLIENT_FIELD_LABELS[k] || k;
+    const val = fmtFieldValue(cl[k]);
+    return `<div class="proj-field" style="${k==='note'||val.length>80?'grid-column:1/-1':''}"><div class="proj-field-label">${escHtml(label)}</div><div class="proj-field-value" style="white-space:pre-wrap">${escHtml(val)}</div></div>`;
+  }).join('');
+  const contacts = Array.isArray(cl.contacts) ? cl.contacts : [];
+  $('cp-contacts').innerHTML = contacts.length ? contacts.map(ct=>{
+    if(!ct || typeof ct!=='object') return `<div style="padding:6px 0">${escHtml(fmtFieldValue(ct))}</div>`;
+    const bits = Object.keys(ct).sort().map(k=>`<div><span style="color:var(--text3)">${escHtml(k)}</span> ${escHtml(fmtFieldValue(ct[k]))}</div>`).join('');
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:14px">${bits}</div>`;
+  }).join('') : '<div style="color:var(--text3);font-size:14px">沒有聯絡人</div>';
+  const positions = (S.positions||[]).filter(p=>(p.client||'')===(cl.name||''));
+  $('cp-pos-count').textContent = positions.length ? `${positions.length} 個職位` : '';
+  $('cp-positions').innerHTML = positions.length ? positions.map(p=>{
+    const rows = [];
+    (S.candidates||[]).forEach(c=>eachPipeline(c).forEach(h=>{ if(String(h.posId)===String(p.id)) rows.push(h); }));
+    const byStatus = {};
+    rows.forEach(h=>{ const s=h.status||'（無狀態）'; byStatus[s]=(byStatus[s]||0)+1; });
+    const breakdown = Object.keys(byStatus).sort().map(s=>`${s} ${byStatus[s]}`).join(' · ');
+    return `<div style="padding:10px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="closeClientPanelDirect();showPage('positions');setTimeout(()=>openProjPanel(${Number(p.id)}),60)">
+      <div style="font-weight:700">${escHtml(p.title||'—')} ${priB(p.priority)}</div>
+      <div style="font-size:13px;color:var(--text2);margin-top:4px">${escHtml(p.status||'—')} · Pipeline ${rows.length} 筆${breakdown?` · ${escHtml(breakdown)}`:''}</div>
+    </div>`;
+  }).join('') : '<div style="color:var(--text3);font-size:14px">沒有客戶名稱相同的職位</div>';
+}
+let _repairSummary = null;
+function previewDataRepair(){
+  exportJSON();
+  const result = normalizeCrm(S);
+  _repairSummary = result.summary;
+  const s = result.summary;
+  const el = $('repairPreview');
+  if(el) el.textContent = `已下載備份。預覽（尚未寫入）：\n職位名稱／客戶字串會更新 ${s.titles} 處\n人選目標職位會更新 ${s.targets} 筆\n職位推薦人數會改成實際 pipeline 數 ${s.counts} 個職位\n舊面試時間會抄到面試中的 pipeline ${s.interviews} 筆\n人選狀態會改成連動 pipeline 的狀態 ${s.statuses} 筆\n優先會收成高／中／低 ${s.priorities} 個職位\n按「套用預覽」才會儲存。`;
+  const btn = $('btn-repair-apply');
+  if(btn) btn.disabled = false;
+}
+function applyDataRepair(){
+  if(!_repairSummary){ showToast('請先預覽'); return; }
+  const result = normalizeCrm(S);
+  const next = result.data;
+  CRM_LISTS.forEach(k=>{ if(next[k]) S[k] = next[k]; });
+  save();
+  render();
+  showToast('✓ 已套用對齊');
+  const btn = $('btn-repair-apply');
+  if(btn) btn.disabled = true;
 }
 
 function editClient(id){
@@ -4331,13 +4651,13 @@ function renderAttnStats(){
 
 let editAttnId = null;
 
-function clockIn(){  const t = new Date().toTimeString().slice(0,5);
+function clockIn(){  const t = taipeiTime();
   $('attn-in').value = t;
   $('attn-in-display').textContent = t;
 }
 
 function clockOut(){
-  const t = new Date().toTimeString().slice(0,5);
+  const t = taipeiTime();
   $('attn-out').value = t;
   $('attn-out-display').textContent = t;
 }
@@ -4709,9 +5029,8 @@ function render(){
 }
 
 function renderStats(){
-  const now = new Date();
   const { startStr, endStr, label } = getDashRange();
-  const todayStr = now.toISOString().slice(0,10);
+  const todayStr = today();
   const dashUser = getDashUser();
   const userFilter = c => !dashUser || c.owner===dashUser;
 
@@ -4767,7 +5086,10 @@ function renderStats(){
   }
 
   // Potential case（Offer stage）
-  const potential = S.candidates.filter(c=>c.status==='Offer Stage' && userFilter(c)).length;
+  const potential = S.candidates.reduce((n,c)=>{
+    if(!userFilter(c)) return n;
+    return n + eachPipeline(c).filter(h=>['Offer Stage','等待入職','入職'].includes(h.status)).length;
+  }, 0);
   if($('s-potential')) $('s-potential').textContent = potential;
 
   // Close Case — 從推薦歷程中狀態為「已成交」的記錄計算
@@ -4806,32 +5128,35 @@ function getDashUser(){
 function setDashPeriod(period){
   dashPeriod = period;
   renderStats();
+  if(typeof renderFunnel==='function' && !funnelQ) renderFunnel();
 }
 
 function getDashRange(){
-  const now = new Date();
+  const now = taipeiDateObj();
+  const y = now.getUTCFullYear(), m = now.getUTCMonth(), d = now.getUTCDate();
   let startStr, endStr, label;
-  if(dashPeriod==='lastweek'){
-    const ws = new Date(now); ws.setDate(now.getDate()-now.getDay()-7); ws.setHours(0,0,0,0);
-    const we = new Date(ws); we.setDate(ws.getDate()+6);
-    startStr=ws.toISOString().slice(0,10); endStr=we.toISOString().slice(0,10); label='上週';
+  if(dashPeriod==='lastweek' || dashPeriod==='week'){
+    const shift = dashPeriod==='lastweek' ? -7 : 0;
+    const ws = new Date(Date.UTC(y, m, d - now.getUTCDay() + shift));
+    const we = new Date(ws); we.setUTCDate(ws.getUTCDate()+6);
+    startStr = ws.toISOString().slice(0,10);
+    endStr = we.toISOString().slice(0,10);
+    label = dashPeriod==='lastweek' ? '上週' : '本週';
   } else if(dashPeriod==='month'){
-    startStr=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`;
-    const lastDay=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
-    endStr=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    startStr=`${y}-${String(m+1).padStart(2,'0')}-01`;
+    const lastDay=new Date(Date.UTC(y, m+1, 0)).getUTCDate();
+    endStr=`${y}-${String(m+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
     label='本月';
   } else if(dashPeriod==='quarter'){
-    const q = Math.ceil((now.getMonth()+1)/3);
-    const qStart = (q-1)*3; // 0-based month index
+    const q = Math.ceil((m+1)/3);
+    const qStart = (q-1)*3;
     const qEnd = qStart+2;
-    startStr=`${now.getFullYear()}-${String(qStart+1).padStart(2,'0')}-01`;
-    const lastDay=new Date(now.getFullYear(),qEnd+1,0).getDate();
-    endStr=`${now.getFullYear()}-${String(qEnd+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    startStr=`${y}-${String(qStart+1).padStart(2,'0')}-01`;
+    const lastDay=new Date(Date.UTC(y, qEnd+1, 0)).getUTCDate();
+    endStr=`${y}-${String(qEnd+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
     label=`Q${q}`;
   } else {
-    const ws=new Date(now); ws.setDate(now.getDate()-now.getDay()); ws.setHours(0,0,0,0);
-    const we=new Date(ws); we.setDate(ws.getDate()+6);
-    startStr=ws.toISOString().slice(0,10); endStr=we.toISOString().slice(0,10); label='本週';
+    startStr=`${y}-01-01`; endStr=`${y}-12-31`; label=`${y}`;
   }
   return { startStr, endStr, label };
 }
@@ -5032,148 +5357,81 @@ function setFunnelQ(q, btn){
   renderFunnel();
 }
 
-function renderFunnel(){
-  const wrap = $('funnelWrap'); if(!wrap) return;
-
-  const stages = [
-    { label:'Shortlist',     statuses:['履歷推薦'],         color:'#3d6fa8', bg:'rgba(61,111,168,.12)' },
-    { label:'Interview',     statuses:['面試-1st','面試-2nd','面試-3rd'],         color:'#c4973a', bg:'rgba(196,151,58,.12)' },
-    { label:'Offer stage',   statuses:['Offer Stage'],        color:'#2d8a72', bg:'rgba(45,138,114,.12)' },
-    { label:'Close case',    statuses:['已成交'],           color:'#b85260', bg:'rgba(184,82,96,.12)' },
-  ];
-
-  const now = new Date();
-  const yr = now.getFullYear();
-
-  function inQuarter(dateStr, q){
-    if(!q) return true;
-    if(!dateStr) return false;
-    const m = parseInt((dateStr||'').split('-')[1]);
-    if(isNaN(m)) return false;
-    return Math.ceil(m/3) === q;
+function funnelWindow(){
+  if(funnelQ){
+    const p = taipeiParts();
+    const yr = p.year;
+    const sm = (funnelQ-1)*3+1;
+    const em = sm+2;
+    const start = `${yr}-${String(sm).padStart(2,'0')}-01`;
+    const last = new Date(Date.UTC(+yr, em, 0)).getUTCDate();
+    const end = `${yr}-${String(em).padStart(2,'0')}-${String(last).padStart(2,'0')}`;
+    return { start, end, label:`${yr} Q${funnelQ}` };
   }
-
-  const counts = stages.map(s => {
-    let n = 0;
-    if(s.label === 'Close case'){
-      n = (S.candidates||[]).filter(c=>
-        (c.posHistory||[]).some(h=>
-          (h.logs||[]).some(l=>l.status==='已成交' && (!funnelQ || inQuarter(l.date||'', funnelQ)))
-        )
-      ).length;
-    } else if(s.label === 'Shortlist'){
-      const shortlistStatuses = ['履歷推薦','面試-1st','面試-2nd','面試-3rd','Offer Stage','等待入職','入職','已成交','客戶拒絕','人選拒絕'];
-      n = (S.candidates||[]).filter(c=>
-        (c.posHistory||[]).some(h=>
-          (h.logs||[]).some(l=>
-            shortlistStatuses.includes(l.status) &&
-            (!funnelQ || inQuarter(l.date||'', funnelQ))
-          )
-        )
-      ).length;
-    } else {
-      // Interview、Offer stage — 從 posHistory logs 找對應狀態的日期
-      n = (S.candidates||[]).filter(c=>
-        (c.posHistory||[]).some(h=>
-          (h.logs||[]).some(l=>
-            s.statuses.includes(l.status) &&
-            (!funnelQ || inQuarter(l.date||'', funnelQ))
-          )
-        )
-      ).length;
-    }
-    return { ...s, n };
-  });
-
-  const maxN = Math.max(...counts.map(s=>s.n), 1);
-  const W = Math.max(wrap.clientWidth || 300, 160);
-  const barH = 13;
-  const gap = 4;
-  const padTop = 2;
-  const labelCol = 90;
-  const trackStart = labelCol + 8;
-  const trackW = Math.max(W - trackStart - 120, 40);
-  const H = padTop + counts.length * (barH + gap) + 20;
-  const qLabel = funnelQ ? `Q${funnelQ}  ${yr}` : `${yr} 全年度`;
-
-  // detect dark mode
-  const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const textPrimary   = isDark ? '#e8e8f0' : '#1a1a2e';
-  const textSecondary = isDark ? '#9090a8' : '#6b6b80';
-  const trackFill     = isDark ? '#222228' : '#f0f0f4';
-  const font = 'system-ui, -apple-system, sans-serif';
-
-  let svg = `<svg width="100%" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
-
-  counts.forEach((s, i) => {
-    const by = padTop + i * (barH + gap);
-    const fillW = maxN > 0 ? Math.max((s.n / maxN) * trackW, s.n > 0 ? 8 : 2) : 2;
-
-    svg += `
-    <g style="cursor:pointer" onclick="funnelFilter(${i})">
-      <text x="${labelCol}" y="${by + barH/2 + 1}"
-        text-anchor="end" dominant-baseline="central"
-        fill="${textSecondary}"
-        font-size="11" font-weight="600" font-family="${font}">${s.label}</text>
-      <rect x="${trackStart}" y="${by}" width="${trackW}" height="${barH}" rx="8" fill="${trackFill}"/>
-      <rect x="${trackStart}" y="${by}" width="${fillW}" height="${barH}" rx="8" fill="${s.color}" opacity="0.9"/>
-      <text x="${trackStart + fillW + 8}" y="${by + barH/2}"
-        text-anchor="start" dominant-baseline="central"
-        fill="${s.color}"
-        font-size="13" font-weight="700" font-family="monospace">${s.n}</text>
-    </g>`;
-  });
-
-  svg += `</svg>`;
-  wrap.innerHTML = svg;
-
-  // ── Offer stage & Close case 詳情 → 右欄獨立面板 ──
-  const offerCands = (S.candidates||[]).filter(c=>c.status==='Offer Stage');
-  const closeCands = (S.deals||[]).filter(d=>d.date&&d.date.startsWith(String(yr))&&inQuarter(d.date,funnelQ));
-
-  // Offer Stage panel
-  const offerEl = document.getElementById('dashOfferList');
-  if(offerEl){
-    if(offerCands.length){
-      offerEl.innerHTML = offerCands.map(c=>{
-        const h = (c.posHistory||[]).find(x=>x.status==='Offer Stage') || (c.posHistory||[])[0];
-        const client = h ? h.posClient : '';
-        const pos = h ? h.posTitle : '';
-        return `<div style="padding:5px 0;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;gap:4px;align-items:center;font-size:13px">
-          <span style="color:#1a1a1a;font-weight:600">${escHtml(client||'—')}</span>
-          <span style="color:var(--text3)">·</span>
-          <span style="color:var(--text2)">${escHtml(pos||'—')}</span>
-          <span style="color:#1a1a1a;cursor:pointer" onclick="openDetail(${Number(c.id)})">${escHtml(c.name)}</span>
-        </div>`;
-      }).join('');
-    } else {
-      offerEl.innerHTML = '<span style="font-size:13px;color:var(--text3)">目前無 Offer 階段人選</span>';
-    }
-  }
-
-  // Close Case panel
-  const closeEl = document.getElementById('dashCloseList');
-  if(closeEl){
-    if(closeCands.length){
-      closeEl.innerHTML = closeCands.map(d=>`
-        <div style="padding:5px 0;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;gap:4px;align-items:center;font-size:13px">
-          <span style="color:#1a1a1a;font-weight:600">${escHtml(d.client||'—')}</span>
-          <span style="color:var(--text3)">·</span>
-          <span style="color:var(--text2)">${escHtml(d.position||'—')}</span>
-          <span style="color:#1a1a1a">${escHtml(d.candidate||'—')}</span>
-        </div>`).join('');
-    } else {
-      closeEl.innerHTML = '<span style="font-size:13px;color:var(--text3)">本期尚無成交案</span>';
-    }
-  }
+  const r = getDashRange();
+  return { start:r.startStr, end:r.endStr, label:r.label };
 }
 
-const FUNNEL_STAGES=[
-  {statuses:['履歷推薦']},
-  {statuses:['面試-1st','面試-2nd','面試-3rd']},
-  {statuses:['Offer Stage']},
-  {statuses:['已成交']}
-];
+function renderFunnel(){
+  const wrap = $('funnelWrap'); if(!wrap) return;
+  const win = funnelWindow();
+  const owner = (typeof getDashUser==='function') ? getDashUser() : '';
+  const counts = computeFunnel(S, win, owner);
+  const maxN = Math.max(...counts.map(s=>s.ever), 1);
+  const W = Math.max(wrap.clientWidth || 320, 200);
+  const barH = 16;
+  const gap = 8;
+  const padTop = 4;
+  const labelCol = 92;
+  const trackStart = labelCol + 8;
+  const trackW = Math.max(W - trackStart - 150, 48);
+  const H = padTop + counts.length * (barH + gap) + 8;
+  const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const textSecondary = isDark ? '#9090a8' : '#6b6b80';
+  const trackFill = isDark ? '#222228' : '#f0f0f4';
+  const font = 'system-ui, -apple-system, sans-serif';
+  let svg = `<svg width="100%" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="招募漏斗">`;
+  counts.forEach((s, i) => {
+    const by = padTop + i * (barH + gap);
+    const fillW = Math.max((s.ever / maxN) * trackW, s.ever>0 ? 8 : 2);
+    const conv = s.conv==null ? '' : ` ${s.conv}%`;
+    svg += `<g style="cursor:pointer" onclick="funnelFilter(${i})">
+      <text x="${labelCol}" y="${by + barH/2 + 1}" text-anchor="end" dominant-baseline="central" fill="${textSecondary}" font-size="11" font-weight="600" font-family="${font}">${s.label}</text>
+      <rect x="${trackStart}" y="${by}" width="${trackW}" height="${barH}" rx="8" fill="${trackFill}"/>
+      <rect x="${trackStart}" y="${by}" width="${fillW}" height="${barH}" rx="8" fill="${s.color}" opacity="0.9"/>
+      <text x="${trackStart + fillW + 8}" y="${by + barH/2}" text-anchor="start" dominant-baseline="central" fill="${s.color}" font-size="12" font-weight="700" font-family="monospace">${s.ever}${conv} ·現${s.current}</text>
+    </g>`;
+  });
+  svg += `</svg>`;
+  const note = `期間 ${escHtml(win.label)}（${escHtml(win.start)}～${escHtml(win.end)}）。長條是這段期間內曾到達該階段的人選×職位；「現」是目前停在此階段（不受期間限制）；百分比是相對上一階段的曾到達人數。`;
+  wrap.innerHTML = svg + `<div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:6px">${note}</div>`;
+
+  const offerRows = [];
+  const closeRows = [];
+  (S.candidates||[]).forEach(c=>{
+    if(owner && c.owner!==owner) return;
+    eachPipeline(c).forEach(h=>{
+      if(['Offer Stage','等待入職','入職'].includes(h.status)) offerRows.push({c,h});
+      if(h.status==='已成交') closeRows.push({c,h});
+    });
+  });
+  const rowHtml = (rows, empty) => rows.length ? rows.slice(0,12).map(({c,h})=>{
+    const nm = pipelineNames(h);
+    return `<div style="padding:5px 0;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;gap:4px;align-items:center;font-size:13px">
+      <span style="color:#1a1a1a;font-weight:600">${escHtml(nm.client||'—')}</span>
+      <span style="color:var(--text3)">·</span>
+      <span style="color:var(--text2)">${escHtml(nm.title||'—')}</span>
+      <span style="color:#1a1a1a;cursor:pointer" onclick="openDetail(${Number(c.id)})">${escHtml(c.name)}</span>
+      <span style="color:var(--text3)">${escHtml(h.status||'')}</span>
+    </div>`;
+  }).join('') : `<span style="font-size:13px;color:var(--text3)">${empty}</span>`;
+  const offerEl = document.getElementById('dashOfferList');
+  if(offerEl) offerEl.innerHTML = rowHtml(offerRows, '目前沒有停留在 Offer / 等待入職 / 入職的人選');
+  const closeEl = document.getElementById('dashCloseList');
+  if(closeEl) closeEl.innerHTML = rowHtml(closeRows, '目前沒有已成交的 pipeline');
+}
+
+const FUNNEL_STAGES = FUNNEL_STAGE_DEFS.map(s=>({ statuses:s.exact }));
 
 function funnelFilter(idx){
   const stage = FUNNEL_STAGES[idx]; if(!stage) return;
@@ -5257,15 +5515,20 @@ function renderPosTable(){
   if(q) list = list.filter(p=>[p.client,p.title,p.owner,p.note].join(' ').toLowerCase().includes(q));
   if(clientF) list = list.filter(p=>p.client===clientF);
   if(titleF)  list = list.filter(p=>p.title===titleF);
+  const priF = $('posPriorityFilter')?.value||'';
+  if(priF) list = list.filter(p=>normalizePriority(p.priority)===priF);
 
   const sort = $('posSortDate')?.value || 'desc';
   if(sort==='asc')  list.sort((a,b)=>(a.openDate||'') > (b.openDate||'') ? 1 : -1);
   if(sort==='desc') list.sort((a,b)=>(a.openDate||'') < (b.openDate||'') ? 1 : -1);
   $('posTable').innerHTML = list.length ? list.map(p=>{
-    const linked = S.candidates.filter(c=>c.positionId==p.id);
-    const candHtml = linked.length
-      ? `<span style="font-family:var(--mono);font-weight:700;color:var(--accent);font-size:17px">${linked.length}</span><span style="font-size:13px;color:var(--text3)"> 人</span>`
+    const linkedN = countPipelines(p.id);
+    const candHtml = linkedN
+      ? `<span style="font-family:var(--mono);font-weight:700;color:var(--accent);font-size:17px">${linkedN}</span><span style="font-size:13px;color:var(--text3)"> 人</span>`
       : `<span style="color:var(--text3);font-size:13px">—</span>`;
+    const pri = normalizePriority(p.priority);
+    const priOpts = ['高','中','低'].concat(['高','中','低'].includes(pri) ? [] : [pri]);
+    const priSelect = `<select aria-label="優先" onclick="event.stopPropagation()" onchange="event.stopPropagation();setPositionPriority(${Number(p.id)}, this.value)" class="priority ${pri==='高'?'p-high':pri==='中'?'p-mid':'p-low'}" style="font-size:13px;padding:2px 6px;border-radius:6px;border:1px solid var(--border);background:var(--surface);cursor:pointer;font-family:var(--font)">${priOpts.map(x=>`<option value="${escHtml(x)}" ${pri===x?'selected':''}>${escHtml(x)}</option>`).join('')}</select>`;
     return `<tr class="clickable" style="cursor:pointer" onclick="openProjPanel(${p.id})">
       <td style="white-space:nowrap"><strong>${escHtml(p.client)}</strong></td>
       <td style="color:var(--text)">${escHtml(p.title)} <span style="font-size:13px;color:var(--text3)">→</span></td>
@@ -5278,7 +5541,7 @@ function renderPosTable(){
           <option value="暫停"    ${p.status==='暫停'   ?'selected':''}>暫停</option>
         </select>
       </td>
-      <td>${priB(p.priority)}</td>
+      <td onclick="event.stopPropagation()">${priSelect}</td>
       <td><div style="display:flex;flex-wrap:wrap;gap:3px;max-width:200px">${candHtml}</div></td>
       <td style="color:var(--text3);font-family:var(--mono);font-size:13px">${p.openDate||'—'}</td>
       <td style="color:var(--text3);font-family:var(--mono);font-size:13px">${p.lastUpdate||'—'}</td>
@@ -5302,6 +5565,31 @@ function updatePositionStatus(posId, newStatus){
   renderDashboard();
   if($('page-positions').classList.contains('active')) renderPosTable();
   if($('pp-meta')) renderProjPanel();
+}
+
+function setPositionPriority(posId, priority){
+  const p = (S.positions||[]).find(x=>String(x.id)===String(posId)); if(!p) return;
+  const norm = ['高','中','低'].includes(priority) ? priority : normalizePriority(priority);
+  if(p.priority===norm) return;
+  p.priority = norm;
+  if($('page-positions')?.classList.contains('active')) renderPosTable();
+  renderDashboard();
+  if(!fbDb || !fbAuth?.currentUser){ save(); return; }
+  fbDb.ref('data/positions').transaction(list=>{
+    const arr = asList(list);
+    const item = arr.find(x=>String(x.id)===String(posId));
+    if(item) item.priority = norm;
+    return arr;
+  }, (err, committed)=>{
+    if(err || !committed){ showToast('⚠ 優先順序儲存失敗'); return; }
+    if(_baseJson){
+      const base = JSON.parse(_baseJson);
+      if(base.positions && base.positions[String(posId)]){
+        base.positions[String(posId)].priority = norm;
+        _baseJson = JSON.stringify(base);
+      }
+    }
+  }, false);
 }
 
 function renderCandDB(){
@@ -5427,6 +5715,7 @@ function renderPipeline(){
     const rejectLog = isRejected ? [...(c.logs||[])].reverse().find(l=>l.text&&(l.text.includes('客戶拒絕')||l.text.includes('人選拒絕'))) : null;
     const rejectDate = rejectLog ? rejectLog.date : '';
     const iv = resolvePipelineInterview(c, h);
+    const nm = pipelineNames(h);
     const interviewHtml = (iv.date || iv.time || iv.note)
       ? `<div style="color:#1a1a1a;font-weight:600">📅 ${escHtml(iv.date ? fmtFull(iv.date) : '')}${iv.time ? ' '+escHtml(iv.time) : ''}</div>${iv.note ? `<div style="font-size:12px;color:var(--text2);font-family:var(--font);font-weight:400;margin-top:2px">📍 ${escHtml(iv.note)}</div>` : ''}`
       : (hLastLog ? `${escHtml(fmtFull(hLastLog.date))}${hLastLog.time ? ' '+escHtml(hLastLog.time) : ''}` : (statusDate ? escHtml(fmtFull(statusDate)) : '—'));
@@ -5446,8 +5735,8 @@ function renderPipeline(){
         <span style="font-size:13px;color:#1a1a1a">${escHtml(c.company||'')}</span>
         ${isRejected&&rejectDate?`<br><span style="font-size:11px;color:var(--accent3)">${escHtml(h.status)} · ${escHtml(rejectDate)}</span>`:''}
       </td>
-      <td style="font-size:15px;color:#1a1a1a">${escHtml(h.posClient||'—')}</td>
-      <td style="font-size:15px;color:#1a1a1a">${escHtml(h.posTitle||'—')}</td>
+      <td style="font-size:15px;color:#1a1a1a">${escHtml(nm.client||'—')}</td>
+      <td style="font-size:15px;color:#1a1a1a">${escHtml(nm.title||'—')}</td>
       <td onclick="event.stopPropagation()" style="white-space:nowrap">
         <select onchange="event.stopPropagation();updatePosHistoryStatus(${cid},${pid},this.value);this.style.background=this.value==='已成交'?'rgba(184,82,96,.15)':'var(--surface)';this.style.color=this.value==='已成交'?'var(--accent3)':'#1a1a1a'"
           style="font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:${h.status==='已成交'?'rgba(184,82,96,.15)':'var(--surface)'};color:${h.status==='已成交'?'var(--accent3)':'#1a1a1a'};font-family:var(--font);cursor:pointer;outline:none">
@@ -5603,7 +5892,7 @@ function savePipeline(){
       c.target = `${p.client}．${p.title}`;
       if(!c.posHistory) c.posHistory=[];
       if(!c.posHistory.find(h=>Number(h.posId)===posId)){
-        c.posHistory.push({ posId, posClient:p.client, posTitle:p.title, date:today(), status, note:'', logs:[{date:today(),time:new Date().toTimeString().slice(0,5),status}] });
+        c.posHistory.push({ posId, posClient:p.client, posTitle:p.title, date:today(), status, note:'', logs:[{date:today(),time:taipeiTime(),status}] });
       }
       p.lastUpdate = today();
     }
@@ -5698,7 +5987,7 @@ function renderClients(){
   }
   tbody.innerHTML = list.map(cl=>{
     const c1=cl.contacts?.[0];
-    return `<tr>
+    return `<tr class="clickable" style="cursor:pointer" onclick="openClientPanel(${Number(cl.id)})">
       <td>
         <div style="font-weight:700;font-size:17px">${escHtml(cl.name)}</div>
         <div style="font-size:13px;color:var(--text3);margin-top:2px">${cl.taxid?`統編 ${escHtml(cl.taxid)}`:''}</div>
@@ -5717,8 +6006,8 @@ function renderClients(){
       <td style="max-width:160px;font-size:15px;color:var(--text2)">${cl.note?escHtml(cl.note.slice(0,50)+(cl.note.length>50?'…':'')):'—'}</td>
       <td style="white-space:nowrap">
         <div style="display:flex;align-items:center;gap:8px">
-          <button class="btn-icon perm-edit-client" style="font-size:13px;padding:4px 8px" onclick="editClient(${cl.id})">編輯</button>
-          <span class="perm-edit-client" style="color:var(--accent3);font-size:15px;cursor:pointer;font-weight:700;padding:2px 6px" onclick="deleteClient(${cl.id})">✕</span>
+          <button class="btn-icon perm-edit-client" style="font-size:13px;padding:4px 8px" onclick="event.stopPropagation();editClient(${Number(cl.id)})">編輯</button>
+          <span class="perm-edit-client" style="color:var(--accent3);font-size:15px;cursor:pointer;font-weight:700;padding:2px 6px" onclick="event.stopPropagation();deleteClient(${Number(cl.id)})">✕</span>
         </div>
       </td>
     </tr>`;
@@ -5784,7 +6073,7 @@ function savePartnerCand(){
     posHistory: pos ? [{
       posId: pos.id, posClient: pos.client, posTitle: pos.title,
       date: today(), status: '初步接觸', note: '',
-      logs: [{ date: today(), time: now.toTimeString().slice(0,5), status: '初步接觸', note: consultant ? '外包推薦 by '+consultant : '外包推薦' }]
+      logs: [{ date: today(), time: taipeiTime(), status: '初步接觸', note: consultant ? '外包推薦 by '+consultant : '外包推薦' }]
     }] : [],
     interviewDate:'', interviewTime:'', interviewNote:''
   };
@@ -5871,7 +6160,7 @@ function partnerUpdateStatus(candId, posId, newStatus){
   if(!c.posHistory) c.posHistory=[];
   var h = c.posHistory.find(function(x){ return Number(x.posId)===Number(posId); });
   var now = new Date();
-  var logEntry = { date:today(), time:now.toTimeString().slice(0,5), status:newStatus, note:'' };
+  var logEntry = { date:today(), time:taipeiTime(), status:newStatus, note:'' };
   if(h){
     h.status = newStatus;
     if(!h.logs) h.logs=[];
@@ -5923,11 +6212,9 @@ function rejectPartnerCand(candId){
     S.candidates = S.candidates.filter(function(x){ return x.id!==candId; });
     // 從 partnerCandidates 也移除
     if(fbDb){
-      fbDb.ref('partnerCandidates').once('value').then(snap=>{
-        const raw = snap.val();
-        if(!raw) return;
-        const list = Array.isArray(raw) ? raw : Object.values(raw);
-        fbDb.ref('partnerCandidates').set(list.filter(x=>x.id!==candId));
+      fbDb.ref('partnerCandidates').transaction(raw=>{
+        const list = asList(raw);
+        return list.filter(x=>x && x.id!==candId);
       });
     }
     save(); renderPartner(); render();
@@ -5992,7 +6279,7 @@ function openAddDealModal(){
   editingDealId=null;
   $('dealModalTitle').textContent='新增成交紀錄';
   $('dealSaveBtn').textContent='儲存';
-  const now=new Date().toISOString().slice(0,10);
+  const now=today();
   $('d-date').value=now; $('d-invdate').value=now;
   ['d-client','d-position','d-candidate','d-salary','d-invno','d-buyer','d-taxid','d-addr','d-note'].forEach(id=>{const el=$(id);if(el)el.value='';});
   ['d-amount','d-tax','d-total','d-fee'].forEach(id=>{const el=$(id);if(el)el.value='';});
@@ -6749,7 +7036,7 @@ function downloadICS(id, posId){
 // ── Schedule Calendar ──
 let calYear = new Date().getFullYear();
 let calMonth = new Date().getMonth(); // 0-based
-let calSelectedDate = new Date().toISOString().slice(0,10);
+let calSelectedDate = today();
 
 function scheduleMonthOffset(n){
   if(n===0){ calYear=new Date().getFullYear(); calMonth=new Date().getMonth(); }
@@ -6758,7 +7045,7 @@ function scheduleMonthOffset(n){
 }
 
 function renderSchedule(){
-  const today = new Date().toISOString().slice(0,10);
+  const today = today();
   
   
 
@@ -6930,7 +7217,7 @@ function renderScheduleDetail(dateStr, interviewMap, pipelineCands, today){
 }
 
 function updateScheduleBadge(scheduled){
-  const today = new Date().toISOString().slice(0,10);
+  const today = today();
   const list = scheduled || S.candidates.flatMap(c=>listCandidateInterviews(c));
   const todayCount = list.filter(e=>e && e.date===today).length;
   const badgeEl = $('scheduleBadge');
@@ -6998,7 +7285,7 @@ function checkInterviewReminders(){
   if(Notification.permission !== 'granted') return;
   checkJoinDateReminders();
   const now = new Date();
-  const todayStr = now.toISOString().slice(0,10);
+  const todayStr = today();
 
   S.candidates.forEach(c=>{
     listCandidateInterviews(c).forEach(iv=>{
@@ -7118,7 +7405,7 @@ function clearEduRows(){
 // ── 12-month join date reminder ──
 function checkJoinDateReminders(){
   if(Notification.permission !== 'granted') return;
-  const today_ = new Date().toISOString().slice(0,10);
+  const today_ = today();
   S.candidates.forEach(c=>{
     if(!c.joindate) return;
     const jdate = new Date(c.joindate+'T00:00:00');
@@ -7215,7 +7502,7 @@ function openAddInterviewModal(){
     sel.appendChild(grp2);
   }
   // Pre-fill date with today
-  $('ai-date').value = new Date().toISOString().slice(0,10);
+  $('ai-date').value = today();
   $('ai-time').value = '';
   $('ai-note').value = '';
   $('ai-client').value = '';
@@ -7269,7 +7556,7 @@ function saveAddInterview(){
     if(['初步接觸','履歷推薦','人才庫（未推薦）',''].includes(h.status||'')){
       h.status = '面試-1st';
       if(!h.logs) h.logs = [];
-      h.logs.push({ date: today(), time: new Date().toTimeString().slice(0,5), status:'面試-1st' });
+      h.logs.push({ date: today(), time: taipeiTime(), status:'面試-1st' });
     }
     if(Number(c.positionId)===Number(h.posId) && ['初步接觸','履歷推薦','人才庫（未推薦）',''].includes(c.status||'')){
       c.status = '面試-1st';
@@ -7295,12 +7582,12 @@ if(typeof Notification !== 'undefined' && Notification.permission === 'granted')
 // update schedule badge and notify button on load
 updateScheduleBadge();
 updateNotifyBtn();
-// Auto-select current quarter in funnel
+// Funnel follows the dashboard period until a quarter tab is chosen.
 (function(){
-  const q = Math.ceil((new Date().getMonth()+1)/3);
-  funnelQ = q;
+  funnelQ = 0;
   const tabs = document.querySelectorAll('#funnelQTabs button');
-  if(tabs[q-1]){ tabs[q-1].style.color='var(--accent)'; tabs[q-1].style.borderColor='var(--accent)'; }
+  const allBtn = tabs[tabs.length-1];
+  if(allBtn){ allBtn.style.color='var(--accent)'; allBtn.style.borderColor='var(--accent)'; }
 })();
 window.addEventListener('resize', ()=>{ if($('funnelWrap')?.offsetParent) renderFunnel(); });
 render();
