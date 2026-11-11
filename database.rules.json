@@ -1,0 +1,12 @@
+{
+  "rules": {
+    "data": {
+      ".read": "auth != null && (auth.token.email == 'tina.yang.hannor@gmail.com' || auth.token.email == 'ivy.hannor@gmail.com' || auth.token.email == 'helen.tsai@hannortw.com' || auth.token.email == 'ethen.chang@hannortw.com')",
+      ".write": "auth != null && (auth.token.email == 'tina.yang.hannor@gmail.com' || auth.token.email == 'ivy.hannor@gmail.com' || auth.token.email == 'helen.tsai@hannortw.com' || auth.token.email == 'ethen.chang@hannortw.com')"
+    },
+    "partnerCandidates": {
+      ".read": "auth != null && (auth.token.email == 'tina.yang.hannor@gmail.com' || auth.token.email == 'ivy.hannor@gmail.com' || auth.token.email == 'helen.tsai@hannortw.com' || auth.token.email == 'ethen.chang@hannortw.com')",
+      ".write": "auth != null && (auth.token.email == 'tina.yang.hannor@gmail.com' || auth.token.email == 'ivy.hannor@gmail.com' || auth.token.email == 'helen.tsai@hannortw.com' || auth.token.email == 'ethen.chang@hannortw.com')"
+    }
+  }
+}
