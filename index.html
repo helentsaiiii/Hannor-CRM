@@ -362,7 +362,9 @@ textarea.form-input{resize:vertical;min-height:70px}
 <!-- Loading 畫面 -->
 <div id="loadingScreen" style="position:fixed;inset:0;background:#1a2744;display:flex;align-items:center;justify-content:center;z-index:9999;flex-direction:column;gap:16px">
   <div style="color:#c4973a;font-size:20px;font-weight:700;letter-spacing:2px">Hannor Consulting</div>
-  <div style="color:rgba(255,255,255,.5);font-size:14px">載入中…</div>
+  <div id="loadingMessage" style="color:rgba(255,255,255,.5);font-size:14px">載入中…</div>
+  <div id="loadingDetail" style="display:none;color:#fff;font-size:14px;text-align:center;max-width:420px;line-height:1.6;padding:0 24px"></div>
+  <button id="loadingRetry" type="button" style="display:none;background:#c4973a;color:#1a2744;border:none;border-radius:8px;padding:8px 16px;font-weight:700;cursor:pointer" onclick="location.reload()">重新整理</button>
 </div>
 
 <div class="login-screen" id="loginScreen">
@@ -1925,39 +1927,102 @@ let fbAuth, fbDb;
 let _fbSaveTimer = null;
 let _realtimeEnabled = false;
 
+function bootTimeoutMs(){ return window.__BOOT_TIMEOUT_MS || 12000; }
+
+function showLoader(message){
+  const loading = $('loadingScreen'); if(!loading) return;
+  loading.style.display = 'flex';
+  const msg = $('loadingMessage');
+  if(msg) msg.textContent = message || '載入中…';
+  const detail = $('loadingDetail');
+  if(detail){ detail.style.display = 'none'; detail.textContent = ''; }
+  const retry = $('loadingRetry');
+  if(retry) retry.style.display = 'none';
+}
+
+function showBootError(message){
+  const loading = $('loadingScreen'); if(!loading) return;
+  loading.style.display = 'flex';
+  const msg = $('loadingMessage');
+  if(msg) msg.textContent = '無法完成載入';
+  const detail = $('loadingDetail');
+  if(detail){ detail.style.display = 'block'; detail.textContent = message || '請重新整理後再試。'; }
+  const retry = $('loadingRetry');
+  if(retry) retry.style.display = 'inline-block';
+}
+
+function settleSignedOut(message){
+  currentLoginUser = null;
+  const loading = $('loadingScreen'); if(loading) loading.style.display = 'none';
+  const ls = $('loginScreen'); if(ls) ls.classList.remove('hidden');
+  if(message && $('loginError')) $('loginError').textContent = message;
+}
+
+let _authSeq = 0;
+function handleAuthUser(fbUser){
+  const seq = ++_authSeq;
+  if(!fbUser){
+    settleSignedOut('');
+    return;
+  }
+  showLoader('載入資料…');
+  loadFromFirebase(()=>{
+    if(seq !== _authSeq) return;
+    try{
+      const email = (fbUser.email||'').toLowerCase();
+      const matched = (S.users||[]).find(u=>(S.userMeta?.[u]?.email||'').toLowerCase()===email);
+      const adminName = ADMIN_EMAIL_MAP[email];
+      if(adminName && !(S.users||[]).includes(adminName)){
+        if(!S.users) S.users=[];
+        S.users.unshift(adminName);
+        if(!S.userMeta) S.userMeta={};
+        if(!S.userMeta[adminName]) S.userMeta[adminName]={};
+        S.userMeta[adminName].email = fbUser.email;
+      }
+      currentLoginUser = matched || adminName || fbUser.displayName || fbUser.email;
+      applyLogin(currentLoginUser);
+      enableRealtimeSync();
+    }catch(e){
+      console.error('boot:', e);
+      showBootError('載入畫面時發生錯誤：'+(e&&e.message?e.message:e));
+    }
+  }, (err)=>{
+    if(seq !== _authSeq) return;
+    console.error('load:', err);
+    const denied = err && (err.code==='PERMISSION_DENIED' || /permission/i.test(err.message||''));
+    showBootError(denied
+      ? '沒有讀取資料的權限。請用已授權的帳號登入。'
+      : '無法讀取資料：'+(err&&err.message?err.message:'請檢查網路後重新整理'));
+  });
+}
+
+function armBootWatchdog(){
+  if(window.__bootWatchArmed) return;
+  window.__bootWatchArmed = true;
+  setTimeout(()=>{
+    const loading = $('loadingScreen');
+    if(!loading || loading.style.display==='none') return;
+    if($('loadingDetail') && $('loadingDetail').style.display!=='none') return;
+    if(fbAuth && fbAuth.currentUser){
+      showBootError('載入逾時。資料庫沒有在時間內回應，請檢查網路後重新整理。');
+    } else {
+      settleSignedOut('載入逾時。請重新登入。');
+    }
+  }, bootTimeoutMs());
+}
+
 function initFirebase(){
   if(typeof firebase === 'undefined'){ setTimeout(initFirebase, 100); return; }
-  firebase.initializeApp(firebaseConfig);
+  if(!firebase.apps || !firebase.apps.length) firebase.initializeApp(firebaseConfig);
   fbAuth = firebase.auth();
   fbDb   = firebase.database();
-  // 設定 persistence 為 LOCAL（iOS Safari 相容）
-  fbAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).then(()=>{
-    // Auth 狀態監聽（persistence 設好後才啟動）
-    fbAuth.onAuthStateChanged(fbUser=>{
-      if(fbUser){
-        loadFromFirebase(()=>{
-          const email = fbUser.email.toLowerCase();
-          const matched = (S.users||[]).find(u=>(S.userMeta?.[u]?.email||'').toLowerCase()===email);
-          const adminName = ADMIN_EMAIL_MAP[email];
-          if(adminName && !(S.users||[]).includes(adminName)){
-            if(!S.users) S.users=[];
-            S.users.unshift(adminName);
-            if(!S.userMeta) S.userMeta={};
-            if(!S.userMeta[adminName]) S.userMeta[adminName]={};
-            S.userMeta[adminName].email = fbUser.email;
-          }
-          currentLoginUser = matched || adminName || fbUser.displayName || fbUser.email;
-          applyLogin(currentLoginUser);
-        enableRealtimeSync();
-        });
-      } else {
-        currentLoginUser = null;
-        const ls=$('loginScreen'); 
-        const loading=$('loadingScreen'); if(loading) loading.style.display='none';
-        if(ls) ls.classList.remove('hidden');
-      }
-    });
-  }).catch(e=>console.error('persistence error:', e));
+  armBootWatchdog();
+  // 不要等 setPersistence。第一次開啟時 IndexedDB 可能很慢，若把登入狀態監聽放在它後面，載入畫面會一直停著、登入表單也出不來。預設本來就是 LOCAL。
+  fbAuth.onAuthStateChanged(fbUser=>{ handleAuthUser(fbUser); });
+  try{
+    const persistence = firebase.auth && firebase.auth.Auth && firebase.auth.Auth.Persistence;
+    if(persistence) fbAuth.setPersistence(persistence.LOCAL).catch(e=>console.error('persistence error:', e));
+  }catch(e){ console.error('persistence error:', e); }
 }
 
 // ── 儲存（防抖 800ms）──
@@ -1980,29 +2045,37 @@ function save(){
 }
 
 // ── 載入資料 ──
-function loadFromFirebase(cb){
+function loadFromFirebase(cb, onErr){
   if(!fbDb){ if(cb) cb(); return; }
-  fbDb.ref('data').once('value').then(snap=>{
-    const d = snap.val();
-    if(d){
-      // Firebase 有資料，直接用
-      _mergeData(d);
-    } else {
-      // Firebase 空的 → 嘗試從 localStorage 遷移
-      try{
-        const local = localStorage.getItem('hh-v3') || localStorage.getItem('hh-v2');
-        if(local){
-          const parsed = JSON.parse(local);
-          _mergeData(parsed);
-          // 立即上傳到 Firebase
-          fbDb.ref('data').set(JSON.parse(JSON.stringify(S)))
-            .then(()=>showToast('✓ 本機資料已同步到雲端'))
-            .catch(e=>console.error('migrate:', e));
-        }
-      } catch(e){ console.error('localStorage migrate:', e); }
-    }
+  let settled = false;
+  const finish = (err)=>{
+    if(settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if(err){ if(onErr) onErr(err); else if(cb) cb(); return; }
     if(cb) cb();
-  }).catch(e=>{ console.error('load:', e); showToast('⚠ 載入資料失敗'); if(cb) cb(); });
+  };
+  const timer = setTimeout(()=>finish(new Error('資料庫回應逾時')), bootTimeoutMs());
+  fbDb.ref('data').once('value').then(snap=>{
+    try{
+      const d = snap.val();
+      if(d){
+        _mergeData(d);
+      } else {
+        try{
+          const store = (typeof localStorage!=='undefined') ? localStorage : null;
+          const local = store && (store.getItem('hh-v3') || store.getItem('hh-v2'));
+          if(local){
+            _mergeData(JSON.parse(local));
+            fbDb.ref('data').set(JSON.parse(JSON.stringify(S)))
+              .then(()=>showToast('✓ 本機資料已同步到雲端'))
+              .catch(e=>console.error('migrate:', e));
+          }
+        }catch(e){ console.error('localStorage migrate:', e); }
+      }
+      finish();
+    }catch(e){ finish(e); }
+  }).catch(e=>finish(e));
 }
 
 function _mergeData(d){
@@ -2028,9 +2101,17 @@ function enableRealtimeSync(){
   fbDb?.ref('data').on('value', snap=>{
     if(_fbSaveTimer) return; // 自己正在寫入，略過
     const d = snap.val(); if(!d) return;
-    const prev = JSON.stringify(S);
-    _mergeData(d);
-    if(JSON.stringify(S)!==prev){ render(); showToast('🔄 資料已同步'); }
+    try{
+      const prev = JSON.stringify(S);
+      _mergeData(d);
+      if(JSON.stringify(S)!==prev){ render(); showToast('🔄 資料已同步'); }
+    }catch(e){
+      console.error('sync:', e);
+      showToast('⚠ 同步資料時發生錯誤');
+    }
+  }, err=>{
+    console.error('data listen:', err);
+    showToast('⚠ 即時同步中斷，請重新整理');
   });
 
   // 監聽外包顧問推薦的人選（從外包平台寫入）
@@ -7045,7 +7126,7 @@ function scheduleMonthOffset(n){
 }
 
 function renderSchedule(){
-  const today = today();
+  const todayStr = today();
   
   
 
@@ -7110,9 +7191,9 @@ function renderSchedule(){
 
   for(let d=1;d<=daysInMonth;d++){
     const dateStr = `${calYear}-${String(calMonth+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
-    const isToday = dateStr===today;
+    const isToday = dateStr===todayStr;
     const isSel = dateStr===calSelectedDate;
-    const isPast = dateStr<today;
+    const isPast = dateStr<todayStr;
     const interviews = interviewMap[dateStr]||[];
     // Pipeline people with NO interview date but whose status might be relevant
     // We show them in a separate color only if they have interview date set to this day
@@ -7143,7 +7224,7 @@ function renderSchedule(){
   grid.innerHTML = cells;
 
   // Render selected day detail
-  renderScheduleDetail(calSelectedDate, interviewMap, pipelineCands, today);
+  renderScheduleDetail(calSelectedDate, interviewMap, pipelineCands, todayStr);
 
   // Update notify button
   const btn = $('notifyBtn');
@@ -7217,9 +7298,9 @@ function renderScheduleDetail(dateStr, interviewMap, pipelineCands, today){
 }
 
 function updateScheduleBadge(scheduled){
-  const today = today();
+  const todayStr = today();
   const list = scheduled || S.candidates.flatMap(c=>listCandidateInterviews(c));
-  const todayCount = list.filter(e=>e && e.date===today).length;
+  const todayCount = list.filter(e=>e && e.date===todayStr).length;
   const badgeEl = $('scheduleBadge');
   if(badgeEl){
     badgeEl.textContent = todayCount||'';
@@ -7267,7 +7348,7 @@ function requestNotifyPermission(){
 }
 
 function updateNotifyBtn(){
-  const btn = $('notifyBtn'); if(!btn) return;
+  const btn = $('notifyBtn'); if(!btn || typeof Notification==='undefined') return;
   if(Notification.permission === 'granted'){
     btn.textContent = '🔔 提醒已開啟';
     btn.className = btn.className.replace('btn-ghost','') + ' btn';
@@ -7579,21 +7660,20 @@ initDate();
 if(typeof Notification !== 'undefined' && Notification.permission === 'granted'){
   startNotifyPolling();
 }
-// update schedule badge and notify button on load
-updateScheduleBadge();
-updateNotifyBtn();
-// Funnel follows the dashboard period until a quarter tab is chosen.
-(function(){
+// Auth first, so a later startup error cannot leave the loading screen up.
+armBootWatchdog();
+initFirebase();
+try{
+  updateScheduleBadge();
+  updateNotifyBtn();
   funnelQ = 0;
   const tabs = document.querySelectorAll('#funnelQTabs button');
   const allBtn = tabs[tabs.length-1];
   if(allBtn){ allBtn.style.color='var(--accent)'; allBtn.style.borderColor='var(--accent)'; }
-})();
-window.addEventListener('resize', ()=>{ if($('funnelWrap')?.offsetParent) renderFunnel(); });
-render();
-refreshOwnerSelects();
-// 登入狀態由 Firebase onAuthStateChanged 自動處理
-initFirebase();
+  window.addEventListener('resize', ()=>{ if($('funnelWrap')?.offsetParent) renderFunnel(); });
+  render();
+  refreshOwnerSelects();
+}catch(e){ console.error('startup:', e); }
 
 </script>
 <style>
